@@ -1,0 +1,1163 @@
+---
+title: "EDA"
+author: "m.ooki"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_float: true
+    fig_width: 7
+    fig_height: 4.5
+    fig_caption: true
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+    code_download: true
+---
+
+# Summary 
+
+* Task : 将来48時間の(2018/5/1-31)のair quality を予測する
+
+* Predict : 2つの市で合計48箇所を将来48時間（1時間ごと）の3指標を予測。48 * 48 = 2304 
+    - the concentration of PM2.5/PM10/O3 for 35 stations in Beijing 
+    - the concentration of PM2.5/PM10 for 13 stations in London
+
+* 訓練データ
+   - 過去のair quality
+   - 過去のMeorogical (weather) ?
+
+* 2018/4/1-30のデータはAPIで取得するみたい
+
+
+# Preparations {.tabset .tabset-fade .tabset-pills}
+
+## libraries
+
+```{r, message=F, warning=F}
+options(scipen=100)
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(corrplot, lib.loc="~/R/x86_64-pc-linux-gnu-library/3.5/")
+#library(ggforce, lib.loc="~/R/x86_64-pc-linux-gnu-library/3.5/") # facet_zoom
+library(scales)
+library(leaflet, lib.loc = "~/R/x86_64-pc-linux-gnu-library/3.5/")
+library(pheatmap, lib.loc = "~/R/x86_64-pc-linux-gnu-library/3.5/")
+```
+
+## vars
+
+```{r}
+DIR_INPUT <- "/mnt/data/kddcup2018/input"
+DIR_OUTPUT_CLEAN <- "/mnt/data/kddcup2018/input_clean"
+DIR_API_INPUT <- "/mnt/data/kddcup2018/input_api"
+```
+
+## Util function
+
+```{r}
+source("~/kddcup2018/utils/ggplot.R")
+source("~/kddcup2018/utils/color.R")
+source("~/kddcup2018/utils/time.R")
+```
+
+## Data Loading
+
+```{r}
+df.bei.aq1 <- fread(paste0(DIR_INPUT,"/beijing_17_18_aq.csv"), header = T)
+df.bei.aq2 <- fread(paste0(DIR_INPUT,"/beijing_201802_201803_aq.csv"), header = T)
+df.bei.aq <- bind_rows(df.bei.aq1, df.bei.aq2) %>% arrange(stationId)
+rm(df.bei.aq1, df.bei.aq2)
+df.bei.obs.meo <- fread(paste0(DIR_INPUT,"/beijing_17_18_meo.csv"), header = T)
+df.bei.obs.meo.map <- select(df.bei.obs.meo, station_id, longitude, latitude) %>% unique()
+df.bei.obs.meo.2 <- fread(paste0(DIR_INPUT,"/beijing_201802_201803_me.csv"), header = T) %>% left_join(df.bei.obs.meo.map, by = "station_id")
+df.bei.obs.meo <- bind_rows(df.bei.obs.meo, df.bei.obs.meo.2) %>% arrange(station_id)
+rm(df.bei.obs.meo.2, df.bei.obs.meo.map)
+df.bei.grid.meo <- fread(paste0(DIR_INPUT,"/Beijing_historical_meo_grid.csv"), header = T)
+df.bei.station <- fread(paste0(DIR_INPUT,"/Beijing_AirQuality_Stations_en.csv"), header = T)
+```
+
+```{r}
+df.lon.station <- fread(paste0(DIR_INPUT,"/London_AirQuality_Stations.csv"), header = T)
+df.lon.grid.meo <- fread(paste0(DIR_INPUT,"/London_historical_meo_grid.csv"), header = T)
+df.lon.aq1 <- fread(paste0(DIR_INPUT,"/London_historical_aqi_forecast_stations_20180331.csv"), header = T)
+df.lon.aq2 <- fread(paste0(DIR_INPUT,"/London_historical_aqi_other_stations_20180331.csv"), header = T)
+```
+
+```{r}
+df.submit <- fread(paste0(DIR_INPUT,"/sample_submission.csv"), header = T, logical01 = F)
+```
+
+## API Data Loading
+
+```{r}
+API_ENDTIME <- format(Sys.time() - (1 * 60 * 60 + 9 * 60 * 60), "%Y-%m-%d-%H")
+SPAN <- paste0("2018-03-31-00_",API_ENDTIME)
+df.api.bei.aq <- fread(paste0(DIR_API_INPUT,"/",SPAN,"/bj_airquality.csv"), header = T)
+df.api.ld.aq <- fread(paste0(DIR_API_INPUT,"/",SPAN,"/ld_airquality.csv"), header = T)
+df.api.bei.obs.meo <- fread(paste0(DIR_API_INPUT,"/",SPAN,"/bj_meteorology.csv"), header = T)
+df.api.bei.grid.meo <- fread(paste0(DIR_API_INPUT,"/",SPAN,"/bj_grid_meteorology.csv"), header = T)
+df.api.ld.grid.meo <- fread(paste0(DIR_API_INPUT,"/",SPAN,"/ld_grid_meteorology.csv"), header = T)
+```
+
+# Data Cleansing {.tabset .tabset-fade .tabset-pills}
+
+## Names
+
+```{r}
+names(df.bei.aq)[1] <- "station_id"
+df.bei.aq %<>% select(utc_time, everything())
+names(df.bei.station) <- c("area","station_id","long","lati") 
+names(df.bei.obs.meo)[2:3] <- c("long","lati")
+names(df.bei.grid.meo)[2:3] <- c("long","lati")
+names(df.bei.grid.meo)[9] <- "wind_speed"
+```
+
+```{r}
+names(df.lon.aq1)[2:6] <- c("utc_time", "station_id", "PM2.5","PM10", "NO2")
+names(df.lon.aq2)[1:5] <- c("station_id", "utc_time", "PM2.5","PM10", "NO2") 
+df.lon.aq2 %<>% select(utc_time, everything())
+names(df.lon.station) <- c("station_id","api_data","need_prediction","historical_data","lati","long","area","area_name")
+names(df.lon.grid.meo)[2:3] <- c("long","lati")
+names(df.lon.grid.meo)[9] <- "wind_speed"
+```
+
+```{r}
+names(df.api.bei.aq)[3:9] <- c("utc_time","PM2.5","PM10","NO2","CO","O3","SO2")
+names(df.api.ld.aq)[3:9] <- c("utc_time","PM2.5","PM10","NO2","CO","O3","SO2")
+names(df.api.bei.grid.meo)[2:3] <- c("stationName", "utc_time")
+names(df.api.bei.obs.meo)[2:3] <- c("stationName", "utc_time")
+names(df.api.ld.grid.meo)[2:3] <- c("stationName", "utc_time")
+```
+
+## Delete unused column
+
+```{r}
+df.lon.aq1 %<>% select(-V1)
+df.lon.aq2 %<>% select(-V6, -V7)
+```
+
+```{r}
+df.api.bei.aq %<>% select(-id)
+df.api.ld.aq %<>% select(-id, -CO, -O3, -SO2)
+df.api.bei.obs.meo %<>% select(-id)
+df.api.bei.grid.meo %<>% select(-id)
+df.api.ld.grid.meo %<>% select(-id)
+```
+
+## Time Convert
+
+```{r}
+df.bei.aq %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S")) 
+df.bei.obs.meo %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S")) 
+df.bei.grid.meo %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S")) 
+df.lon.aq1 %<>% mutate(utc_time = parse_date_time(utc_time, "%Y/%m/%d %H:%M")) 
+df.lon.aq2 %<>% mutate(utc_time = parse_date_time(utc_time, "%Y/%m/%d %H:%M")) 
+df.lon.grid.meo %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S"))
+```
+
+```{r}
+df.api.bei.aq %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S"))
+df.api.bei.obs.meo %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S"))
+df.api.bei.grid.meo %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S"))
+
+df.api.ld.aq %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S"))
+df.api.ld.grid.meo %<>% mutate(utc_time = parse_date_time(utc_time, "%Y-%m-%d %H:%M:%S"))
+```
+
+## Beijing the nearest Obs point
+
+```{r}
+df.bei.station %>% select(station_id, long, lati) %>% mutate(group = "target") -> tmp1
+df.bei.obs.meo %>% select(station_id, long, lati) %>%  unique() %>% mutate(group = "obs") -> tmp2
+df.tmp <- bind_rows(tmp1, tmp2) %>% mutate(number = row_number())
+dist.matrix <- df.tmp %>% select(long, lati) %>% as.matrix() %>% dist() 
+reshape::melt(as.matrix(dist.matrix), varnames = c("row", "col")) %>%
+  filter(value != 0) %>%
+  filter(col > 36) %>% #35までがtargetなのでそれを除く
+  filter(row <= 35) %>% #35までがtargetなのでそれを除く
+  group_by(row) %>%
+  dplyr::summarise(col = col[which.min(value)], min_dist = min(value)) -> df.min.dist
+
+df.tmp %>%
+  select(station_id, number) %>%
+  inner_join(df.min.dist, by = c("number" = "row")) %>%
+  select(-number) -> tmp1
+df.tmp %>%
+  select(station_id, number) %>%
+  setnames("station_id", "nearest") %>%
+  inner_join(df.min.dist, by = c("number" = "col")) %>%
+  select(nearest, number) %>%
+  setnames("number", "col") -> tmp2
+tmp1 %>%
+  inner_join(tmp2, by = "col") %>%
+  select(station_id, nearest) %>%
+  unique() -> df.bei.obs.nearest
+rm(tmp1, tmp2, df.tmp)
+```
+
+
+## Beijing the nearest Grid point
+
+```{r}
+df.bei.station %>% select(station_id, long, lati) %>% mutate(group = "target") -> tmp1
+df.bei.grid.meo %>% select(stationName, long, lati) %>% unique() %>% mutate(group = "grid") %>% rename(station_id = "stationName") -> tmp2
+df.tmp <- bind_rows(tmp1, tmp2) %>% mutate(number = row_number())
+dist.matrix <- df.tmp %>% select(long, lati) %>% as.matrix() %>% dist() 
+reshape::melt(as.matrix(dist.matrix), varnames = c("row", "col")) %>%
+  filter(value != 0) %>%
+  filter(col > 36) %>% #35までがtargetなのでそれを除く
+  filter(row <= 35) %>% #35までがtargetなのでそれを除く
+  group_by(row) %>%
+  dplyr::summarise(col = col[which.min(value)], min_dist = min(value)) -> df.min.dist
+
+df.tmp %>%
+  select(station_id, number) %>%
+  inner_join(df.min.dist, by = c("number" = "row")) %>%
+  select(-number) -> tmp1
+df.tmp %>%
+  select(station_id, number) %>%
+  setnames("station_id", "nearest") %>%
+  inner_join(df.min.dist, by = c("number" = "col")) %>%
+  select(nearest, number) %>%
+  setnames("number", "col") -> tmp2
+tmp1 %>%
+  inner_join(tmp2, by = "col") %>%
+  select(station_id, nearest) %>%
+  unique() -> df.bei.grid.nearest
+rm(tmp1, tmp2, df.tmp)
+```
+
+## London the nearest Grid point
+
+```{r}
+df.lon.station %>% filter(need_prediction == "TRUE") %>% select(station_id, long, lati) %>% mutate(group = "target") -> tmp1
+df.lon.grid.meo %>% select(stationName, long, lati) %>% unique() %>% mutate(group = "grid") %>% rename(station_id = "stationName") -> tmp2
+df.tmp <- bind_rows(tmp1, tmp2) %>% mutate(number = row_number())
+rm(tmp1, tmp2)
+dist.matrix <- df.tmp %>% select(long, lati) %>% as.matrix() %>% dist() 
+reshape::melt(as.matrix(dist.matrix), varnames = c("row", "col")) %>%
+  filter(value != 0) %>%
+  filter(col > 13) %>% #13までがtargetなのでそれを除く
+  filter(row <= 13) %>% #13までがtargetなのでそれを除く
+  group_by(row) %>%
+  dplyr::summarise(col = col[which.min(value)], min_dist = min(value)) -> df.min.dist
+
+df.tmp %>%
+  select(station_id, number) %>%
+  inner_join(df.min.dist, by = c("number" = "row")) %>%
+  select(-number) -> tmp1
+df.tmp %>%
+  select(station_id, number) %>%
+  setnames("station_id", "nearest") %>%
+  inner_join(df.min.dist, by = c("number" = "col")) %>%
+  select(nearest, number) %>%
+  setnames("number", "col") -> tmp2
+tmp1 %>%
+  inner_join(tmp2, by = "col") %>%
+  select(station_id, nearest) %>%
+  unique() -> df.lon.grid.nearest
+rm(tmp1, tmp2, df.tmp)
+```
+
+## Beijing weather Join
+
+```{r}
+df.bei.aq %>%
+  inner_join(df.bei.grid.nearest, by = "station_id") %>%
+  left_join(df.bei.grid.meo, by = c("nearest" = "stationName", "utc_time")) %>%
+  select(-nearest, -long, -lati) %>%
+  rename(grid1_temperature = "temperature",
+         grid1_pressure = "pressure",
+         grid1_humidity = "humidity",
+         grid1_wind_direction = "wind_direction",
+         grid1_wind_speed = "wind_speed") -> df.bei.aq.weather
+
+df.bei.aq.weather %>%
+  inner_join(df.bei.obs.nearest, by = "station_id") %>%
+  left_join(df.bei.obs.meo, by = c("nearest" = "station_id", "utc_time")) %>%
+  select(-nearest, -long, -lati) %>%
+  rename(obs1_temperature = "temperature",
+         obs1_pressure = "pressure",
+         obs1_humidity = "humidity",
+         obs1_wind_direction = "wind_direction",
+         obs1_wind_speed = "wind_speed",
+         obs1_weather = "weather") -> df.bei.aq.weather
+```
+
+## London weather Join
+
+```{r}
+df.lon.aq1 %>%
+  inner_join(df.lon.grid.nearest, by = "station_id") %>%
+  left_join(df.lon.grid.meo, by = c("nearest" = "stationName", "utc_time")) %>%
+  select(-nearest, -long, -lati) %>%
+  rename(grid1_temperature = "temperature",
+         grid1_pressure = "pressure",
+         grid1_humidity = "humidity",
+         grid1_wind_direction = "wind_direction",
+         grid1_wind_speed = "wind_speed") -> df.lon.aq1.weather
+```
+
+## Save1
+
+```{r}
+write.table(df.bei.aq, paste0(DIR_OUTPUT_CLEAN,"/original_bei_aq.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.bei.aq, paste0(DIR_OUTPUT_CLEAN,"/original_bei_aq.RDS"))
+write.table(df.lon.aq1, paste0(DIR_OUTPUT_CLEAN,"/original_lon_aq1.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.lon.aq1, paste0(DIR_OUTPUT_CLEAN,"/original_lon_aq1.RDS"))
+write.table(df.lon.aq2, paste0(DIR_OUTPUT_CLEAN,"/original_lon_aq2.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.lon.aq2, paste0(DIR_OUTPUT_CLEAN,"/original_lon_aq2.RDS"))
+
+write.table(df.bei.aq.weather, paste0(DIR_OUTPUT_CLEAN,"/original_bei_aq_weather.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.bei.aq.weather, paste0(DIR_OUTPUT_CLEAN,"/original_bei_aq_weather.RDS"))
+write.table(df.lon.aq1.weather, paste0(DIR_OUTPUT_CLEAN,"/original_lon_aq1_weather.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.lon.aq1.weather, paste0(DIR_OUTPUT_CLEAN,"/original_lon_aq1_weather.RDS"))
+
+write.table(df.bei.obs.nearest, paste0(DIR_OUTPUT_CLEAN,"/bei_obs_nearest.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.bei.obs.nearest, paste0(DIR_OUTPUT_CLEAN,"/bei_obs_nearest.RDS"))
+write.table(df.bei.grid.nearest, paste0(DIR_OUTPUT_CLEAN,"/bei_grid_nearest.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.bei.grid.nearest, paste0(DIR_OUTPUT_CLEAN,"/bei_grid_nearest.RDS"))
+write.table(df.lon.grid.nearest, paste0(DIR_OUTPUT_CLEAN,"/lon_grid_nearest.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.lon.grid.nearest, paste0(DIR_OUTPUT_CLEAN,"/lon_grid_nearest.RDS"))
+
+#save(list=ls(), file="all.Rdata")
+```
+
+## Bind AQ and Weather original and api 
+
+```{r}
+df.api.bei.aq %>%
+  inner_join(df.bei.grid.nearest, by = "station_id") %>%
+  left_join(df.api.bei.grid.meo, by = c("nearest" = "stationName", "utc_time")) %>%
+  select(-nearest) %>%
+  rename(grid1_temperature = "temperature",
+         grid1_pressure = "pressure",
+         grid1_humidity = "humidity",
+         grid1_wind_direction = "wind_direction",
+         grid1_wind_speed = "wind_speed",
+         grid1_weather = "weather") -> df.api.bei.aq.weather
+
+df.api.bei.aq.weather %>%
+  inner_join(df.bei.obs.nearest, by = "station_id") %>%
+  left_join(df.api.bei.obs.meo, by = c("nearest" = "stationName", "utc_time")) %>%
+  select(-nearest) %>%
+  rename(obs1_temperature = "temperature",
+         obs1_pressure = "pressure",
+         obs1_humidity = "humidity",
+         obs1_wind_direction = "wind_direction",
+         obs1_wind_speed = "wind_speed",
+         obs1_weather = "weather") -> df.api.bei.aq.weather
+
+df.api.ld.aq %>%
+  inner_join(df.lon.grid.nearest, by = "station_id") %>%
+  left_join(df.api.ld.grid.meo, by = c("nearest" = "stationName", "utc_time")) %>%
+  select(-nearest) %>%
+  rename(grid1_temperature = "temperature",
+         grid1_pressure = "pressure",
+         grid1_humidity = "humidity",
+         grid1_wind_direction = "wind_direction",
+         grid1_wind_speed = "wind_speed",
+         grid1_weather = "weather") -> df.api.ld.aq.weather
+
+df.bei.aq <- bind_rows(df.bei.aq.weather, df.api.bei.aq.weather) %>% unique() %>% arrange(station_id)
+stations <- unique(df.lon.aq1$station_id)
+df.lon.aq1 <- bind_rows(df.lon.aq1.weather, filter(df.api.ld.aq.weather, station_id %in% stations)) %>% unique() %>% arrange(station_id)
+```
+
+## Save2
+
+```{r}
+write.table(df.bei.aq, paste0(DIR_OUTPUT_CLEAN,"/api_bind_bei_aq.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.bei.aq, paste0(DIR_OUTPUT_CLEAN,"/api_bind_bei_aq.RDS"))
+write.table(df.lon.aq1, paste0(DIR_OUTPUT_CLEAN,"/api_bind_lon_aq1.tsv"), sep = "\t", quote = F, row.names = F)
+saveRDS(df.lon.aq1, paste0(DIR_OUTPUT_CLEAN,"/api_bind_lon_aq1.RDS"))
+```
+
+## Time trancate
+
+```{r}
+df.bei.aq %<>% trancateTime("utc_time")
+df.lon.aq1 %<>% trancateTime("utc_time")
+df.lon.aq2 %<>% trancateTime("utc_time")
+```
+
+## Submit File
+
+```{r}
+df.submit %>%
+  tidyr::separate(test_id, c("basho","hour"), sep = "#") -> df.submit.clean
+```
+
+# Map  {.tabset .tabset-fade .tabset-pills}
+
+## Beijing 
+- 予測対象は35 Stations
+- Observedは18箇所で測定してる
+- Gridは651箇所で測定してる
+
+```{r}
+df.bei.station %>% select(station_id, long, lati) %>% mutate(group = "target") -> tmp1
+df.bei.obs.meo %>% select(station_id, long, lati) %>%  unique() %>% mutate(group = "obs") -> tmp2
+df.bei.grid.meo %>% select(stationName, long, lati) %>% unique() %>% mutate(group = "grid") %>% rename(station_id = "stationName") -> tmp3
+df.color <- data.frame(group = c("target","obs","grid"), color = c(drsimonj_cols("red"),  drsimonj_cols("blue"),  drsimonj_cols("green")), stringsAsFactors = F)
+tmp1 %>%
+  bind_rows(tmp2) %>%
+  bind_rows(tmp3) %>%
+  inner_join(df.color, by = "group") %>%
+  mutate(number = row_number()) %>%
+  leaflet() %>%
+  addTiles() %>%
+  addMarkers(~long, ~lati, label = ~as.character(station_id)) %>%
+  addCircleMarkers(~long, ~lati, color = ~color)
+rm(tmp1,tmp2,tmp3)
+```
+
+## London
+- 予測対象は13 Stations
+- 非予測対象は11 Stations
+- Gridは861箇所で測定してる
+
+```{r}
+df.lon.station %>% filter(need_prediction == "TRUE") %>% select(station_id, long, lati) %>% mutate(group = "target") -> tmp1
+df.lon.station %>% filter(is.na(.$need_prediction)) %>% select(station_id, long, lati) %>% mutate(group = "non_target") -> tmp2
+df.lon.grid.meo %>% select(stationName, long, lati) %>% unique() %>% mutate(group = "grid") %>% rename(station_id = "stationName") -> tmp3
+df.color <- data.frame(group = c("target","non_target","grid"), color = c(drsimonj_cols("red"),  drsimonj_cols("blue"),  drsimonj_cols("green")), stringsAsFactors = F)
+tmp1 %>%
+  bind_rows(tmp2) %>%
+  bind_rows(tmp3) %>%
+  inner_join(df.color, by = "group") %>% 
+  mutate(number = row_number()) %>%
+  leaflet() %>%
+  addTiles() %>%
+  addMarkers(~long, ~lati, label = ~as.character(station_id)) %>%
+  addCircleMarkers(~long, ~lati, color = ~color)
+rm(tmp1,tmp2,tmp3)
+```
+
+# Overview  {.tabset .tabset-fade .tabset-pills}
+
+## Beijing glimpse 
+
+- 6つの指標（PM2.5, PM10, NO2, CO, O3, SO2）の場所×1時間ごとの値
+
+```{r}
+glimpse(df.bei.aq)
+```
+
+センサー等で測定しているWeatherデータ。Beijingで18箇所の天気測定結果。2017/1/30 - 2018/1/31 まである
+
+```{r}
+glimpse(df.bei.obs.meo)
+```
+
+NOAAが提供してるWeatherデータ。Beijingで 651箇所の天気測定結果。1時間ごとに2017/1/1 - 2018/3/27 まである
+
+```{r}
+glimpse(df.bei.grid.meo)
+```
+
+## London glimpse 
+
+Londonのどの地域を予測するかを記したデータ
+
+```{r}
+print(df.lon.station)
+```
+
+3つの指標（PM2.5, PM10, NO2）の場所×1時間ごとの値
+
+```{r}
+glimpse(df.lon.aq1)
+```
+
+- 3つの指標（PM2.5, PM10, NO2）の場所×1時間ごとの値
+
+```{r}
+glimpse(df.lon.aq2)
+```
+
+NOAAが提供してるWeatherデータ。Londonで 861箇所の天気測定結果。1時間ごとに2017/1/1 - 2018/3/27 まである
+
+```{r}
+glimpse(df.lon.grid.meo)
+```
+
+## Start and End Date
+
+```{r}
+print(paste0("Bei AQ Start : ", min(df.bei.aq$utc_time), " End : ", max(df.bei.aq$utc_time)))
+print(paste0("Bei Obs MEO Start : ", min(df.bei.obs.meo$utc_time), " End : ", max(df.bei.obs.meo$utc_time)))
+print(paste0("Bei Grid MEO Start : ", min(df.bei.grid.meo$utc_time), " End : ", max(df.bei.grid.meo$utc_time)))
+print(paste0("Lon AQ1 Start : ", min(df.lon.aq1$utc_time), " End : ", max(df.lon.aq1$utc_time)))
+print(paste0("Lon AQ2 Start : ", min(df.lon.aq2$utc_time,na.rm=T), " End : ", max(df.lon.aq2$utc_time,na.rm=T)))
+print(paste0("Lon Grid MEO Start : ", min(df.lon.grid.meo$utc_time), " End : ", max(df.lon.grid.meo$utc_time)))
+```
+
+## Start and End Date by Station ID
+
+```{r}
+stations <- unique(df.bei.aq$station_id)
+for(sta in stations){
+  df.bei.aq %>%
+    filter(station_id == sta) -> tmp
+  print(paste0(sta," - Bei AQ Start : ", min(tmp$utc_time), " End : ", max(tmp$utc_time)))
+}
+
+stations <- unique(df.lon.aq1$station_id)
+for(sta in stations){
+  df.lon.aq1 %>%
+    filter(station_id == sta) -> tmp
+  print(paste0(sta," - Lon AQ1 Start : ", min(tmp$utc_time), " End : ", as.character(max(tmp$utc_time))))
+}
+```
+
+## Summary
+
+```{r}
+summary(df.bei.aq)
+```
+
+- 999999(about 900000) is outlier ?
+- Difference between NA and 999999 ?
+- If the wind speed is less than 0.5m/s (nearly no wind), the value of the wind_direction is 999017.
+
+```{r}
+summary(df.bei.obs.meo)
+```
+
+- filter 900000
+
+```{r}
+df.bei.obs.meo %>%
+  filter(temperature < 999999 & humidity < 999999 & wind_direction < 900000) %>% summary
+```
+
+## Outlier Count
+
+- 999999 
+
+```{r}
+df.bei.obs.meo %>%
+  purrr::map_df(function(x) sum(x == 999999.0, na.rm = T)) %>%
+  gather(feature, num_outliers) %>%
+  mutate(percent = num_outliers/nrow(df.bei.obs.meo))
+```
+
+## Null Count
+
+`aq` data
+
+```{r}
+df.bei.aq %>%
+  purrr::map_df(function(x) sum(is.na(x))) %>%
+  gather(feature, num_nulls) %>%
+  mutate(percent = num_nulls/nrow(df.bei.aq))
+```
+
+`meo` data
+
+```{r}
+df.bei.obs.meo %>%
+  purrr::map_df(function(x) sum(is.na(x))) %>%
+  gather(feature, num_nulls) %>%
+  mutate(percent = num_nulls/nrow(df.bei.obs.meo))
+```
+
+## Null Check zhiwuyuan_aq in Beijing
+
+zhiwuyuan_aqだけ異常にNull多い。2017/11ごろから
+
+```{r}
+df.bei.aq %>%
+  filter(station_id == "zhiwuyuan_aq") %>%
+  filter(is.na(.$PM2.5)) -> tmp
+unique(floor_date(tmp$utc_time,"1 day"))
+```
+
+## Beijing Data Table
+
+```{r}
+DT::datatable(df.bei.aq %>% head(100))
+DT::datatable(df.bei.obs.meo %>% head(100))
+DT::datatable(df.bei.grid.meo %>% head(100))
+```
+
+## London Data Table
+
+```{r}
+DT::datatable(df.lon.aq1 %>% head(100))
+DT::datatable(df.lon.aq2 %>% head(100))
+DT::datatable(df.lon.grid.meo %>% head(100))
+```
+
+## Beijing station_id
+
+`aq` データにあるBeijingの35地点全部予測すればOK
+
+```{r}
+print(paste0("num:", length(unique(df.bei.aq$station_id))))
+print(unique(df.bei.aq$station_id))
+```
+
+## London station_id
+
+`aq1` データにあるLondonの13地点全部予測すればOK
+
+```{r}
+print(paste0("num:", length(unique(df.lon.aq1$station_id))))
+print(unique(df.lon.aq1$station_id))
+```
+
+## Submit Data 
+
+48箇所ある
+
+```{r}
+plyr::count(df.submit.clean$basho)
+```
+
+```{r}
+plyr::count(df.submit.clean$hour)
+```
+
+
+# Categorical feature statistics {.tabset .tabset-fade .tabset-pills}
+
+## Station ID Count 
+
+`aq`は`station_id`ごとにばらつきはなく8886レコードある
+
+```{r}
+plyr::count(df.bei.aq$station_id) %>% DT::datatable()
+```
+
+`meo`は`statiton_id`に若干ばらつき
+
+```{r}
+plyr::count(df.bei.obs.meo$station_id) %>% DT::datatable()
+```
+
+## Weather Count 
+
+- `Sunny/clean` is 75%
+- `Haze` is 17%
+- `Fog` is 6%
+- `Rain` is 1%
+- `Dust` may be related to target values
+
+```{r}
+plyr::count(df.bei.obs.meo$weather) %>% arrange(desc(freq)) %>% mutate(percent = freq/nrow(df.bei.obs.meo))
+```
+
+# Numerical feature Density : AQ {.tabset .tabset-fade .tabset-pills}
+
+```{r, results='asis', fig.height=20}
+group <- "station_id"
+for(target in c("PM2.5","PM10","NO2","CO","O3","SO2")){
+  g <- ggplot(df.bei.aq, aes_string(x = target, group = group, color = group)) + geom_density() + facet_wrap(~station_id, ncol = 3) + guides(color = FALSE)
+  cat('\n')
+  cat("## ", target," \n")
+  print(g)
+  cat('\n')
+}
+```
+
+# Numerical feature Density : MEO {.tabset .tabset-fade .tabset-pills}
+
+```{r, results='asis', fig.height=20}
+group <- "station_id"
+tmp.df <- df.bei.obs.meo %>% filter(temperature < 999999 & humidity < 999999 & wind_direction < 900000)
+for(target in c("temperature","pressure","humidity","wind_direction","wind_speed")){
+  g <- ggplot(tmp.df, aes_string(x = target, group = group, color = group)) + geom_density() + facet_wrap(~station_id, ncol = 3) + guides(color = FALSE) 
+  cat('\n')
+  cat("## ", target," \n")
+  print(g)
+  cat('\n')
+}
+
+```
+
+# Beijing Time Series Analysis {.tabset .tabset-fade .tabset-pills}
+
+## Setting
+
+```{r}
+X_TARGET <- "utc_time"
+Y_TARGETS <- c("PM2.5","PM10","NO2","CO","O3","SO2")
+DATE_SET <- c("12 hour")
+FUNC <- function(x){mean(x, na.rm=T)}
+df <- df.bei.aq
+```
+
+```{r, results="asis"}
+for(yt in Y_TARGETS){
+  for(ds in DATE_SET){
+    dt <- "new_date"
+    df$new_date <- floor_date(df[,X_TARGET], ds)
+    df.tmp <- group_by(df, new_date) %>% dplyr::summarise_at(vars(contains(yt, ignore.case=TRUE)), FUNC) %>% as.data.frame() # data frame型にしたいため（調べたがこれしかないっぽい）
+    if(is.numeric(df.tmp[,yt])){
+      g <- ggplot(df.tmp, aes_string(x = dt, y = yt)) + geom_line() + geom_point(shape = 21, size = 1)
+      cat('\n')
+      cat("## Y軸：", yt, "　X軸の単位：",ds, "\n")
+      print(g)
+      cat('\n')
+    }
+  }
+}
+```
+
+# Beijing Time Series Analysis by station_id {.tabset .tabset-fade .tabset-pills}
+
+## Setting
+
+```{r}
+X_TARGET <- "utc_time"
+stations <- unique(df.bei.aq$station_id)
+DATE_SET <- c("12 hour")
+df.bei.aq %>%
+  select(station_id, utc_time, PM2.5, PM10, NO2, CO, O3, SO2) %>%
+  gather(dimension, value, -utc_time, -station_id) -> df
+```
+
+```{r, fig.height = 12, results="asis"}
+for(sta in stations){
+  for(ds in DATE_SET){
+    dt <- "new_date"
+    df %>%
+      filter(station_id == sta) %>%
+      mutate(new_date = floor_date(utc_time, ds)) %>%
+      group_by(new_date, dimension) %>%
+      dplyr::summarise(value = mean(value, na.rm = T)) -> df.tmp
+    g <- ggplot(df.tmp, aes(x = new_date, y = value, group = dimension, color = dimension)) + geom_line() + geom_point(shape = 21, size = 1) + facet_wrap(~dimension, nrow = 6, ncol = 1, scale = "free_y") + guides(color = F) + labs(x = paste0("X軸の単位:",ds)) + scale_x_datetime(breaks = date_breaks("month"), date_labels = "%m")
+    cat('\n')
+    cat("## station_id：", sta, "　X軸の単位：",ds, "\n")
+    print(g)
+    cat('\n')
+  }
+}
+```
+
+# London Time Series Analysis by station_id {.tabset .tabset-fade .tabset-pills}
+
+## Setting
+
+```{r}
+X_TARGET <- "utc_time"
+stations <- unique(df.lon.aq1$station_id)
+DATE_SET <- c("12 hour")
+df.lon.aq1 %>%
+  select(station_id, utc_time, PM2.5, PM10, NO2) %>%
+  gather(dimension, value, -utc_time, -station_id) -> df
+```
+
+
+```{r, fig.height = 12, results="asis"}
+for(sta in stations){
+  for(ds in DATE_SET){
+    dt <- "new_date"
+    df %>%
+      filter(station_id == sta) %>%
+      mutate(new_date = floor_date(utc_time, ds)) %>%
+      group_by(new_date, dimension) %>%
+      dplyr::summarise(value = mean(value, na.rm = T)) -> df.tmp
+    g <- ggplot(df.tmp, aes(x = new_date, y = value, group = dimension, color = dimension)) + geom_line() + geom_point(shape = 21, size = 1) + facet_wrap(~dimension, nrow = 6, ncol = 1, scale = "free_y") + guides(color = F) + labs(x = paste0("X軸の単位:",ds)) + scale_x_datetime(breaks = date_breaks("month"), date_labels = "%m")
+    cat('\n')
+    cat("## station_id：", sta, "　X軸の単位：",ds, "\n")
+    print(g)
+    cat('\n')
+  }
+}
+```
+
+# Beijing Time Series Autocorrelation by station_id {.tabset .tabset-fade .tabset-pills}
+
+```{r, results="asis"}
+#ccf(bbb$PM2.5, bbb$NO2)
+stations <- unique(df.bei.aq$station_id)
+targets <- c("PM2.5","PM10","O3")
+for(s in stations){
+  df.bei.aq %>%
+    filter(station_id == s) %>%
+    dplyr::arrange(utc_time) %>%
+    select(-utc_time) -> tmp1
+  for(target in targets){
+    tmp1 %>%
+      select_(target) %>%
+      na.omit() -> tmp2
+    a <- acf(tmp2[[target]], lag.max = 24 * 30, type = "correlation", plot = F)
+    cat('\n')
+    cat("## station_id：", s, "　Y：",target, "\n")
+    plot(a)
+    cat('\n')
+  }
+}
+```
+
+# London Time Series Autocorrelation by station_id {.tabset .tabset-fade .tabset-pills}
+
+```{r, results="asis"}
+#ccf(bbb$PM2.5, bbb$NO2)
+stations <- unique(df.lon.aq1$station_id)
+targets <- c("PM2.5","PM10")
+for(s in stations){
+  df.lon.aq1 %>%
+    filter(station_id == s) %>%
+    dplyr::arrange(utc_time) %>%
+    select(-utc_time) -> tmp1
+  for(target in targets){
+    tmp1 %>%
+      select_(target) %>%
+      na.omit() -> tmp2
+    a <- acf(tmp2[[target]], lag.max = 24 * 30, type = "correlation", plot = F)
+    cat('\n')
+    cat("## station_id：", s, "　Y：",target, "\n")
+    plot(a)
+    cat('\n')
+  }
+}
+```
+
+# Beijing Cross correlation {.tabset .tabset-fade .tabset-pills}
+
+```{r, results="asis"}
+cat('\n')
+cat("## All \n")
+df.bei.aq %>% 
+  select(PM2.5, PM10, NO2, CO, O3, SO2)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+cat('\n')
+
+stations <- unique(df.bei.aq$station_id)
+for(s in stations){
+  #s <- "aotizhongxin_aq"
+  cat('\n')
+  cat(paste0("## station_id：",s, "\n"))
+  df.bei.aq %>% 
+    filter(station_id == s) %>%
+    select(PM2.5, PM10, NO2, CO, O3, SO2) %>%
+    cor(use="pairwise.complete.obs", method = "pearson") %>%
+    corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+  cat('\n')
+}
+```
+
+# London Cross correlation {.tabset .tabset-fade .tabset-pills}
+
+```{r, results="asis"}
+cat('\n')
+cat("## All \n")
+df.lon.aq1 %>% 
+  select(PM2.5, PM10, NO2)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+cat('\n')
+
+stations <- unique(df.lon.aq1$station_id)
+for(s in stations){
+  #s <- "aotizhongxin_aq"
+  cat('\n')
+  cat(paste0("## station_id：",s, "\n"))
+  df.lon.aq1 %>% 
+    filter(station_id == s) %>%
+    select(PM2.5, PM10, NO2) %>%
+    cor(use="pairwise.complete.obs", method = "pearson") %>%
+    corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+  cat('\n')
+}
+```
+
+# Beijing Time Trancate Analysis {.tabset .tabset-fade .tabset-pills}
+
+## Beijing year month
+
+```{r}
+df <- df.bei.aq
+```
+
+```{r}
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(year_month = paste(.$year,formatC(.$month,width=2, flag="0"), sep = "-")) %>%
+  ggplot(aes(x = year_month, y = PM2.5)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(year_month = paste(.$year,formatC(.$month,width=2, flag="0"), sep = "-")) %>%
+  ggplot(aes(x = year_month, y = PM10)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(year_month = paste(.$year,formatC(.$month,width=2, flag="0"), sep = "-")) %>%
+  ggplot(aes(x = year_month, y = O3)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Beijing week_num_of_year
+
+```{r, out.width='\\maxwidth'}
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(week_num_of_year = paste(.$year,formatC(.$month,width=2, flag="0"),formatC(.$week_num_of_year, width=2,flag="0"), sep = "-")) %>%
+  ggplot(aes(x = week_num_of_year, y = PM2.5)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(week_num_of_year = paste(.$year,formatC(.$month,width=2, flag="0"),formatC(.$week_num_of_year, width=2,flag="0"), sep = "-")) %>%
+  ggplot(aes(x = week_num_of_year, y = PM10)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(week_num_of_year = paste(.$year,formatC(.$month,width=2, flag="0"),formatC(.$week_num_of_year, width=2,flag="0"), sep = "-")) %>%
+  ggplot(aes(x = week_num_of_year, y = O3)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## Beijing day
+
+```{r}
+df %>%
+  mutate(day = formatC(.$day,width=2,flag="0")) %>%
+  ggplot(aes(x = day, y = PM2.5)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(day = formatC(.$day,width=2,flag="0")) %>%
+  ggplot(aes(x = day, y = PM10)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(day = formatC(.$day,width=2,flag="0")) %>%
+  ggplot(aes(x = day, y = O3)) + geom_boxplot(outlier.colour = "red")
+```
+
+## Beijing wday
+
+```{r}
+df %>%
+  mutate(wday = formatC(.$wday,width=2,flag="0")) %>%
+  ggplot(aes(x = wday, y = PM2.5)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(wday = formatC(.$wday,width=2,flag="0")) %>%
+  ggplot(aes(x = wday, y = PM10)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(wday = formatC(.$wday,width=2,flag="0")) %>%
+  ggplot(aes(x = wday, y = O3)) + geom_boxplot(outlier.colour = "red")
+```
+
+## Beijing Hour
+
+```{r}
+df %>%
+  mutate(hour = formatC(.$hour,width=2,flag="0")) %>%
+  ggplot(aes(x = hour, y = PM2.5)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(hour = formatC(.$hour,width=2,flag="0")) %>%
+  ggplot(aes(x = hour, y = PM10)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(hour = formatC(.$hour,width=2,flag="0")) %>%
+  ggplot(aes(x = hour, y = O3)) + geom_boxplot(outlier.colour = "red")
+```
+
+# London Time Trancate Analysis {.tabset .tabset-fade .tabset-pills}
+
+## London year month
+
+```{r}
+df <- df.lon.aq1
+```
+
+```{r}
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(year_month = paste(.$year,formatC(.$month,width=2, flag="0"), sep = "-")) %>%
+  ggplot(aes(x = year_month, y = PM2.5)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(year_month = paste(.$year,formatC(.$month,width=2, flag="0"), sep = "-")) %>%
+  ggplot(aes(x = year_month, y = PM10)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## London week_num_of_year
+
+```{r, out.width='\\maxwidth'}
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(week_num_of_year = paste(.$year,formatC(.$month,width=2, flag="0"),formatC(.$week_num_of_year, width=2,flag="0"), sep = "-")) %>%
+  ggplot(aes(x = week_num_of_year, y = PM2.5)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+df %>%
+  mutate(year = year(utc_time)) %>%
+  mutate(week_num_of_year = paste(.$year,formatC(.$month,width=2, flag="0"),formatC(.$week_num_of_year, width=2,flag="0"), sep = "-")) %>%
+  ggplot(aes(x = week_num_of_year, y = PM10)) + geom_boxplot(outlier.colour = "red") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## London day
+
+```{r}
+df %>%
+  mutate(day = formatC(.$day,width=2,flag="0")) %>%
+  ggplot(aes(x = day, y = PM2.5)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(day = formatC(.$day,width=2,flag="0")) %>%
+  ggplot(aes(x = day, y = PM10)) + geom_boxplot(outlier.colour = "red")
+```
+
+## London wday
+
+```{r}
+df %>%
+  mutate(wday = formatC(.$wday,width=2,flag="0")) %>%
+  ggplot(aes(x = wday, y = PM2.5)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(wday = formatC(.$wday,width=2,flag="0")) %>%
+  ggplot(aes(x = wday, y = PM10)) + geom_boxplot(outlier.colour = "red")
+```
+
+## London Hour
+
+```{r}
+df %>%
+  mutate(hour = formatC(.$hour,width=2,flag="0")) %>%
+  ggplot(aes(x = hour, y = PM2.5)) + geom_boxplot(outlier.colour = "red")
+df %>%
+  mutate(hour = formatC(.$hour,width=2,flag="0")) %>%
+  ggplot(aes(x = hour, y = PM10)) + geom_boxplot(outlier.colour = "red")
+```
+
+# Weather {.tabset .tabset-fade .tabset-pills}
+
+## Beijing Grid Weather Mean and Median
+
+天気との関連はあり
+
+```{r}
+mean_na <- function(x){mean(x, na.rm = T)}
+median_na <- function(x){median(x, na.rm = T)}
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(grid1_weather, PM2.5, PM10, O3, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  group_by(grid1_weather) %>%
+  dplyr::summarise_all(funs(median_na))
+
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(grid1_weather, PM2.5, PM10, O3, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  group_by(grid1_weather) %>%
+  dplyr::summarise_all(funs(mean_na))
+```
+
+## Beijing Obs Weather Mean and Median
+
+天気との関連はあり
+
+```{r}
+mean_na <- function(x){mean(x, na.rm = T)}
+median_na <- function(x){median(x, na.rm = T)}
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(obs1_weather, PM2.5, PM10, O3)  %>%
+  group_by(obs1_weather) %>%
+  dplyr::summarise_all(funs(median_na))
+
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(obs1_weather, PM2.5, PM10, O3)  %>%
+  group_by(obs1_weather) %>%
+  dplyr::summarise_all(funs(mean_na))
+```
+
+
+## Beijing Relation with Targets
+
+O3とgrid1_temp / grid1_wind_speed が強いか
+
+```{r}
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(PM2.5, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(PM10, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+
+df.bei.aq %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(O3, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+```
+
+## Beijing Relation between obs and grid
+
+```{r}
+df.bei.aq %>%
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  replace_na(list(obs1_weather = "unknown")) %>%
+  replace_na(list(grid1_weather = "unknown")) %>%
+  group_by(obs1_weather, grid1_weather) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  spread(grid1_weather, n) -> tmp
+row.names(tmp) <- tmp$obs1_weather
+tmp <- select(tmp, -obs1_weather)
+pheatmap(tmp, cluster_row = FALSE, cluster_col = FALSE, display_numbers = TRUE, legend = T)
+```
+
+## London Weather Mean and Median
+
+天気との関連はあり
+
+```{r}
+mean_na <- function(x){mean(x, na.rm = T)}
+median_na <- function(x){median(x, na.rm = T)}
+df.lon.aq1 %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(grid1_weather, PM2.5, PM10, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  group_by(grid1_weather) %>%
+  dplyr::summarise_all(funs(median_na))
+
+df.lon.aq1 %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(grid1_weather, PM2.5, PM10, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  group_by(grid1_weather) %>%
+  dplyr::summarise_all(funs(mean_na))
+```
+
+
+## London Relation with Targets
+
+相関が小さい
+
+```{r}
+df.lon.aq1 %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(PM2.5, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+
+df.lon.aq1 %>% 
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  select(PM10, grid1_temperature, grid1_pressure, grid1_humidity, grid1_wind_direction, grid1_wind_speed)  %>%
+  cor(use="pairwise.complete.obs", method = "pearson") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE, method = "number")
+```
+
+
+## London weather grid
+
+weatherの扱いむずいな…
+
+```{r}
+df.lon.aq1 %>%
+  filter(utc_time >= as.POSIXct("2018-02-01", "UTC")) %>%
+  replace_na(list(grid1_weather = "unknown")) %>%
+  group_by(grid1_weather) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = grid1_weather, y = log10(n), fill = grid1_weather)) + geom_bar(stat = "identity") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+# Next Steps
+
+- Null Time by each dimension
+
+

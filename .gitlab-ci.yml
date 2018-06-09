@@ -1,0 +1,41 @@
+stages:
+  - download_data
+  - create_feature
+  - predict
+
+api_download_data :
+  image: python:3.6-alpine
+  stage: download_data
+  only:
+    - triggers
+    - schedules
+  script:
+    - if [ ! -n "${API_DOWNLOAD_DATA}" ]; then exit; fi
+    - export TZ=Asia/Tokyo
+    - pip install requests
+    - START_TIME='2018-03-31-00'
+    - END_TIME=`date "+%Y-%m-%d-%H"`
+    - python api/api_download.py --start_time ${START_TIME} --end_time ${END_TIME}
+
+feature :
+  image: containers-rstudio:latest
+  stage: create_feature
+  only:
+    - triggers
+    - schedules
+  script:
+    - if [ ! -n "${FEATURE}" ]; then exit; fi
+    #- Rscript feature/create_features_02.R
+    - Rscript feature/create_features_para_030405.R
+
+predict_xg :
+  image: containers-work:latest
+  stage: predict
+  only:
+    - triggers
+    - schedules
+  tags:
+    - maku
+  script:
+    - pip3 install tqdm
+    - bash predict.sh
